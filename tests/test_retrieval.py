@@ -3,8 +3,14 @@
 import numpy as np
 
 from app import chunking
+from app.contextual import contextual_texts
 from app.dense_retriever import ChromaRetriever, FaissRetriever, parents_for
-from app.evaluation import evaluate, rank_of
+from app.evaluation import evaluate, parse_reference, rank_of
+from app.hybrid_retriever import reciprocal_rank_fusion
+from app.metadata_filter import books_named_in
+from app.mmr import mmr
+from app.multi_query import query_versions
+from app.sparse_retriever import BM25Retriever, TfidfRetriever
 
 #a tiny imitation of the PDF's extracted text, including a chapter header split by a page break
 SAMPLE_TEXT = (
@@ -102,23 +108,91 @@ def test_chroma_retriever_matches_faiss():
         assert retriever.search(word, k=1)[0]["id"] == FaissRetriever.build(vectors, children, encode).search(word, k=1)[0]["id"]
 
 
-def test_rank_of_finds_the_parent_containing_the_verse():
+def test_rank_of_finds_the_first_passage_containing_any_answer():
     found = [
         {"book": "John", "chapter": 3, "verse_start": 1, "verse_end": 8},
         {"book": "John", "chapter": 3, "verse_start": 9, "verse_end": 21},
     ]
 
-    assert rank_of(found, "John", 3, 16) == 2
-    assert rank_of(found, "John", 4, 16) is None
+    assert rank_of(found, [("John", 3, 16)]) == 2
+    assert rank_of(found, [("Mark", 1, 1), ("John", 3, 2)]) == 1
+    assert rank_of(found, [("John", 4, 16)]) is None
 
 
 def test_evaluate_scores():
     passage = {"book": "John", "chapter": 3, "verse_start": 16, "verse_end": 16}
     other = {"book": "Genesis", "chapter": 1, "verse_start": 1, "verse_end": 1}
     results = {"first": [passage], "second": [other, passage], "missed": [other]}
-    questions = [{"question": q, "book": "John", "chapter": 3, "verse": 16} for q in results]
+    questions = [
+        {"type": "quote", "question": q, "answer_verses": [parse_reference("John 3:16"), parse_reference("Mark 1:1")]}
+        for q in results
+    ]
 
-    scores, ranks = evaluate(lambda q: results[q], questions)
+    scores, details = evaluate(lambda q: results[q], questions)
 
-    assert ranks == [1, 2, None]
-    assert scores == {"correct at #1": 1, "correct in top 5": 2, "MRR": round((1 + 0.5) / 3, 3)}
+    assert [d["rank"] for d in details] == [1, 2, None]
+    assert scores == {
+        "correct at #1": 1,
+        "correct in top 5": 2,
+        "MRR": round((1 + 0.5) / 3, 3),
+        "coverage@5": round((0.5 + 0.5 + 0) / 3, 3),  # each hit finds 1 of the 2 answers
+    }
+
+
+def passages(*names):
+    return [{"id": n, "text": n} for n in names]
+
+
+def test_bm25_and_tfidf_prefer_passages_with_rare_shared_words():
+    items = passages("the lord is my shepherd", "the lord is good", "the fish swallowed jonah")
+    texts = [p["text"] for p in items]
+
+    for retriever in [BM25Retriever(items, texts), TfidfRetriever(items, texts)]:
+        assert retriever.search("my shepherd")[0]["id"] == "the lord is my shepherd"
+        assert retriever.search("jonah and the fish")[0]["id"] == "the fish swallowed jonah"
+        assert retriever.search("unknown words") == []
+
+
+def test_reciprocal_rank_fusion_rewards_items_ranked_well_in_both_lists():
+    a, b, c = passages("a", "b", "c")
+    fused = reciprocal_rank_fusion([[a, b, c], [b, c, a]], k=3)
+
+    assert [item["id"] for item, _ in fused] == ["b", "a", "c"]
+
+
+def test_mmr_skips_a_near_duplicate():
+    relevance = [0.9, 0.89, 0.5]
+    similarity = [[1, 0.99, 0], [0.99, 1, 0], [0, 0, 1]]
+
+    assert mmr(relevance, similarity, k=2, lambda_=1.0) == [0, 1]  # plain ranking
+    assert mmr(relevance, similarity, k=2, lambda_=0.5) == [0, 2]  # the duplicate makes way
+
+
+def test_books_named_in_reads_book_and_testament_phrases():
+    assert books_named_in("In Psalms, God is our refuge") == {"Psalms"}
+    assert books_named_in("in the Gospel of Luke, the shepherds") == {"Luke"}
+    assert books_named_in("In 1 John, God is love") == {"1 John"}
+    assert books_named_in("in the book of Ruth") == {"Ruth"}
+    assert "Matthew" in books_named_in("In the New Testament, the greatest commandment")
+    assert "Genesis" not in books_named_in("In the New Testament, the greatest commandment")
+    assert books_named_in("Jonah is swallowed by a big fish") is None  # a name alone is not a filter
+
+
+def test_query_versions_add_kjv_wording_and_keywords():
+    versions = query_versions("The Holy Spirit comes and they speak in other languages")
+
+    assert versions[0] == "The Holy Spirit comes and they speak in other languages"
+    assert "Holy Ghost" in versions[1] and "tongues" in versions[1]
+    assert versions[2] == "Holy Spirit comes speak languages"
+
+
+def test_contextual_text_says_where_the_child_sits():
+    parents, parent_verses = chunking.build_parents(
+        make_verses(2, heading="A") + [dict(v, verse=v["verse"] + 2) for v in make_verses(2, heading="B")]
+    )
+    children = chunking.build_children(parents, parent_verses)
+    first, second = contextual_texts(children)
+
+    assert first.startswith("From the book of Genesis (Old Testament, Law), chapter 1 of 1. Section: A. Next section: B.")
+    assert "Previous section: A." in second
+    assert first.endswith(children[0]["text"])

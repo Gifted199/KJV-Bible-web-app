@@ -19,8 +19,26 @@ def parents_for(child_hits, parents_by_id, k=5):
     return [parents_by_id[pid] for pid in parent_ids[:k]]
 
 
+class ParentChildRetriever:
+    """Search the small children, return their parents. A parent's score is its best child's score."""
+
+    def __init__(self, child_retriever, parents_by_id, child_k=50):
+        self.child_retriever = child_retriever
+        self.parents_by_id = parents_by_id
+        self.child_k = child_k  # children fetched per search, so that k distinct parents are usually found
+
+    def search_with_scores(self, query, k=10):
+        best = {}
+        for child, child_score in self.child_retriever.search_with_scores(query, self.child_k):
+            best.setdefault(child["parent_id"], child_score)  # children arrive best first
+        return [(self.parents_by_id[pid], s) for pid, s in list(best.items())[:k]]
+
+    def search(self, query, k=10):
+        return [parent for parent, _ in self.search_with_scores(query, k)]
+
+
 class FaissRetriever:
-    """An exact search index: compares the query with every child."""
+    """An exact search index: compares the query with every item (children, or parents for plain dense search)."""
 
     def __init__(self, index, children, encode):
         self.index = index
@@ -47,11 +65,15 @@ class FaissRetriever:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         faiss.write_index(self.index, str(path))
 
-    def search(self, query, k=10):
-        """The k children closest to the query, best first."""
+    def search_with_scores(self, query, k=10):
+        """The k items closest to the query, best first, with their cosine similarities."""
         query_vector = np.asarray([self.encode(query)], dtype=np.float32)
-        _, positions = self.index.search(query_vector, k)
-        return [self.children[i] for i in positions[0] if i != -1]
+        scores, positions = self.index.search(query_vector, k)
+        return [(self.children[i], float(s)) for i, s in zip(positions[0], scores[0]) if i != -1]
+
+    def search(self, query, k=10):
+        """The k items closest to the query, best first."""
+        return [item for item, _ in self.search_with_scores(query, k)]
 
 
 class ChromaRetriever:

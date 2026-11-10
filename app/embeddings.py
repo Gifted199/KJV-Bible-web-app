@@ -34,13 +34,16 @@ def count_truncated(name, texts):
     return sum(len(model.tokenizer.tokenize(t)) > model.max_seq_length - 2 for t in texts)
 
 
-def embeddings_path(out_dir, name):
-    return Path(out_dir) / "embeddings" / f"{name}.npy"
+def embeddings_path(out_dir, cache_name, suffix=".npy"):
+    return Path(out_dir) / "embeddings" / f"{cache_name}{suffix}"
 
 
-def load_or_embed(name, texts, out_dir):
-    """Load the saved vectors for this model, or embed the texts and save them. Row i is the vector for texts[i]."""
-    path = embeddings_path(out_dir, name)
+def load_or_embed(name, texts, out_dir, cache_name=None):
+    """Load the saved vectors, or embed the texts with this model and save them. Row i is the vector for texts[i].
+
+    cache_name tells apart different texts embedded with the same model (default: the model name, for the children).
+    """
+    path = embeddings_path(out_dir, cache_name or name)
     if path.exists():
         vectors = np.load(path)
         if len(vectors) == len(texts):
@@ -48,4 +51,51 @@ def load_or_embed(name, texts, out_dir):
     path.parent.mkdir(parents=True, exist_ok=True)
     vectors = embed(name, texts, show_progress_bar=True)
     np.save(path, vectors)
+    return vectors
+
+
+#learned sparse (SPLADE): one weight per vocabulary word, almost all of them zero
+SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
+
+
+@cache
+def load_sparse_model():
+    from sentence_transformers import SparseEncoder
+
+    return SparseEncoder(SPLADE_MODEL)
+
+
+def _to_scipy(tensor):
+    import scipy.sparse
+    import torch
+
+    if isinstance(tensor, list):
+        tensor = torch.stack(tensor)
+    tensor = tensor.coalesce().cpu()
+    rows, cols = tensor.indices().numpy()
+    return scipy.sparse.csr_matrix((tensor.values().numpy(), (rows, cols)), shape=tuple(tensor.shape))
+
+
+def sparse_embed_documents(texts, show_progress_bar=False):
+    """A scipy sparse matrix with one row per text."""
+    return _to_scipy(load_sparse_model().encode_document(texts, show_progress_bar=show_progress_bar))
+
+
+def sparse_embed_query(query):
+    """A scipy sparse matrix with one row for the query."""
+    return _to_scipy(load_sparse_model().encode_query([query]))
+
+
+def load_or_sparse_embed(texts, out_dir, cache_name="splade_parents"):
+    """Load the saved SPLADE vectors, or embed the texts and save them. Row i is the vector for texts[i]."""
+    import scipy.sparse
+
+    path = embeddings_path(out_dir, cache_name, suffix=".npz")
+    if path.exists():
+        vectors = scipy.sparse.load_npz(path)
+        if vectors.shape[0] == len(texts):
+            return vectors
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vectors = sparse_embed_documents(texts, show_progress_bar=True)
+    scipy.sparse.save_npz(path, vectors)
     return vectors
