@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data: the PDF and everything generated from it stay local; the test questions are committed
+data/*
+!data/test_questions.json

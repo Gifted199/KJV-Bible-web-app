@@ -1,0 +1,17 @@
+[
+  {"question": "Am I my brother's keeper?", "book": "Genesis", "chapter": 4, "verse": 9},
+  {"question": "For God so loved the world", "book": "John", "chapter": 3, "verse": 16},
+  {"question": "The Lord is my shepherd", "book": "Psalms", "chapter": 23, "verse": 1},
+  {"question": "Thou shalt not kill", "book": "Exodus", "chapter": 20, "verse": 13},
+  {"question": "Blessed are the poor in spirit", "book": "Matthew", "chapter": 5, "verse": 3},
+  {"question": "Jesus wept", "book": "John", "chapter": 11, "verse": 35},
+  {"question": "What is love? Love is patient and kind", "book": "1 Corinthians", "chapter": 13, "verse": 4},
+  {"question": "Jesus feeds five thousand people with loaves and fishes", "book": "Matthew", "chapter": 14, "verse": 21},
+  {"question": "The story of the prodigal son who left home", "book": "Luke", "chapter": 15, "verse": 11},
+  {"question": "Jonah is swallowed by a big fish", "book": "Jonah", "chapter": 1, "verse": 17},
+  {"question": "David kills Goliath with a stone", "book": "1 Samuel", "chapter": 17, "verse": 49},
+  {"question": "Daniel is thrown into the lions' den", "book": "Daniel", "chapter": 6, "verse": 16},
+  {"question": "The Holy Spirit comes at Pentecost and they speak in other languages", "book": "Acts", "chapter": 2, "verse": 4},
+  {"question": "No more tears, death or pain in the new heaven", "book": "Revelation", "chapter": 21, "verse": 4},
+  {"question": "God tells Noah to build an ark", "book": "Genesis", "chapter": 6, "verse": 14}
+]

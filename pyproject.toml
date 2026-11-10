@@ -1,0 +1,30 @@
+[project]
+name = "kjv-rag"
+version = "0.1.0"
+description = "Retrieval-augmented generation over the King James Bible"
+readme = "README.md"
+authors = [
+    { name = "Gifted199", email = "akinloluoyetakin199@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "chromadb>=1.5.9",
+    "faiss-cpu>=1.15.1",
+    "ipykernel>=7.4.0",
+    "numpy>=2.5.4",
+    "pandas>=3.1.1",
+    "pymupdf>=2.1",
+    "sentence-transformers>=6.2.0",
+]
+
+[tool.uv]
+package = false  # app/ is run in place with `python -m app.main`, not installed
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
