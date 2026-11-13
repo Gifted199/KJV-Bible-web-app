@@ -1,15 +1,27 @@
 """Tests for chunking, retrieval and evaluation. They use small made-up inputs, so no model is downloaded."""
 
+import math
+
 import numpy as np
+import pytest
 
 from app import chunking
 from app.contextual import contextual_texts
 from app.dense_retriever import ChromaRetriever, FaissRetriever, parents_for
-from app.evaluation import evaluate, parse_reference, rank_of
+from app.evaluation import (
+    evaluate,
+    load_test_questions,
+    ndcg_at,
+    parse_reference,
+    precision_at,
+    rank_of,
+    recall_at,
+)
 from app.hybrid_retriever import reciprocal_rank_fusion
 from app.metadata_filter import books_named_in
 from app.mmr import mmr
 from app.multi_query import query_versions
+from app.reranker import RerankRetriever
 from app.sparse_retriever import BM25Retriever, TfidfRetriever
 
 #a tiny imitation of the PDF's extracted text, including a chapter header split by a page break
@@ -119,24 +131,45 @@ def test_rank_of_finds_the_first_passage_containing_any_answer():
     assert rank_of(found, [("John", 4, 16)]) is None
 
 
+JOHN_3 = {"book": "John", "chapter": 3, "verse_start": 16, "verse_end": 18}
+MARK_1 = {"book": "Mark", "chapter": 1, "verse_start": 1, "verse_end": 8}
+GENESIS_1 = {"book": "Genesis", "chapter": 1, "verse_start": 1, "verse_end": 5}
+ANSWERS = [parse_reference("John 3:16"), parse_reference("John 3:17"), parse_reference("Mark 1:1")]
+
+
+def test_load_test_questions_counts_the_passages_that_hold_an_answer(tmp_path):
+    path = tmp_path / "questions.json"
+    path.write_text('[{"type": "quote", "question": "q", "answers": ["John 3:16", "John 3:17", "Mark 1:1"]}]')
+
+    [question] = load_test_questions(path, [JOHN_3, MARK_1, GENESIS_1])
+
+    assert question["answer_verses"] == ANSWERS
+    assert question["relevant_passages"] == 2  # John 3:16 and 3:17 share one passage
+
+
+def test_precision_recall_and_ndcg_at_k():
+    found = [GENESIS_1, JOHN_3, MARK_1]
+
+    assert precision_at(found, ANSWERS, k=5) == 2 / 5
+    assert recall_at(found, ANSWERS, k=2) == 2 / 3  # John 3:16 and 3:17, not Mark 1:1
+    best = 1 + 1 / math.log2(3)
+    assert ndcg_at(found, ANSWERS, relevant_passages=2) == pytest.approx((1 / math.log2(3) + 1 / math.log2(4)) / best)
+    assert ndcg_at([JOHN_3, MARK_1], ANSWERS, relevant_passages=2) == 1.0
+
+
 def test_evaluate_scores():
-    passage = {"book": "John", "chapter": 3, "verse_start": 16, "verse_end": 16}
-    other = {"book": "Genesis", "chapter": 1, "verse_start": 1, "verse_end": 1}
-    results = {"first": [passage], "second": [other, passage], "missed": [other]}
+    results = {"first": [JOHN_3], "second": [GENESIS_1, MARK_1], "missed": [GENESIS_1]}
     questions = [
-        {"type": "quote", "question": q, "answer_verses": [parse_reference("John 3:16"), parse_reference("Mark 1:1")]}
-        for q in results
+        {"type": "quote", "question": q, "answer_verses": ANSWERS, "relevant_passages": 2} for q in results
     ]
 
     scores, details = evaluate(lambda q: results[q], questions)
 
     assert [d["rank"] for d in details] == [1, 2, None]
-    assert scores == {
-        "correct at #1": 1,
-        "correct in top 5": 2,
-        "MRR": round((1 + 0.5) / 3, 3),
-        "coverage@5": round((0.5 + 0.5 + 0) / 3, 3),  # each hit finds 1 of the 2 answers
-    }
+    assert scores["MRR"] == round((1 + 0.5) / 3, 3)
+    assert scores["precision@5"] == round((1 / 5 + 1 / 5 + 0) / 3, 3)
+    assert scores["recall@5"] == round((2 / 3 + 1 / 3 + 0) / 3, 3)
+    assert (scores["correct at #1"], scores["correct in top 5"]) == (1, 2)
 
 
 def passages(*names):
@@ -196,3 +229,15 @@ def test_contextual_text_says_where_the_child_sits():
     assert first.startswith("From the book of Genesis (Old Testament, Law), chapter 1 of 1. Section: A. Next section: B.")
     assert "Previous section: A." in second
     assert first.endswith(children[0]["text"])
+
+
+def test_reranker_reorders_the_base_results_by_the_scorers_score():
+    class Base:
+        def search(self, query, k):
+            return passages("lions den", "great fish", "jonah fled")[:k]
+
+    words_shared = lambda question, texts: [len(set(question.split()) & set(t.split())) for t in texts]
+    reranked = RerankRetriever(Base(), words_shared, candidates=3)
+
+    assert [p["id"] for p in reranked.search("jonah and the great fish", k=2)] == ["great fish", "jonah fled"]
+    assert [p["id"] for p in RerankRetriever(Base(), words_shared, candidates=1).search("great fish")] == ["lions den"]

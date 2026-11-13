@@ -13,6 +13,7 @@ from app.hybrid_retriever import HybridRetriever
 from app.metadata_filter import MetadataFilterRetriever
 from app.mmr import MMRRetriever
 from app.multi_query import MultiQueryRetriever
+from app.reranker import CROSS_ENCODERS, RerankRetriever, cross_encoder_scorer
 from app.sparse_retriever import BM25Retriever, SpladeRetriever, TfidfRetriever
 
 MODEL = "mpnet"  # the best embedding model in the MiniLM vs mpnet comparison
@@ -32,7 +33,12 @@ DESCRIPTIONS = {
 
 
 def best_retriever(data_dir="data"):
-    """The winner of the comparison: Hybrid (parent-child dense + BM25), loading the saved mpnet FAISS index."""
+    """The final search: Hybrid finds candidates, then the bge cross-encoder puts the top 10 in order."""
+    return RerankRetriever(build_hybrid(data_dir), cross_encoder_scorer(CROSS_ENCODERS["bge"]))
+
+
+def build_hybrid(data_dir="data"):
+    """The winner of the technique comparison: Hybrid (parent-child dense + BM25), from the saved mpnet FAISS index."""
     children = read_jsonl(f"{data_dir}/children.jsonl")
     parents = read_jsonl(f"{data_dir}/parents.jsonl")
     parents_by_id = {p["id"]: p for p in parents}

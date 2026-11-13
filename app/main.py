@@ -2,9 +2,10 @@
 
     ingest                       PDF -> data/verses.jsonl, parents.jsonl, children.jsonl
     embed    [--model all]       embed the children, build the FAISS index and Chroma collection
-    search   "question"          search with Hybrid (the best technique) and print the best passages
+    search   "question"          search with Hybrid + bge reranking (the most accurate) and print the best passages
     evaluate [--model all]       score each model and store on data/test_questions.json
     compare                      score the ten retrieval techniques on data/test_questions.json
+    rerank                       score Hybrid with a bi-encoder and two cross-encoder rerankers
 """
 
 import argparse
@@ -34,6 +35,10 @@ def load_chunks():
     children = chunking.read_jsonl(f"{DATA_DIR}/children.jsonl")
     parents = chunking.read_jsonl(f"{DATA_DIR}/parents.jsonl")
     return children, {p["id"]: p for p in parents}
+
+
+def load_questions(parents_by_id):
+    return evaluation.load_test_questions(f"{DATA_DIR}/test_questions.json", parents_by_id.values())
 
 
 def load_retriever(store, model_name, children):
@@ -80,10 +85,14 @@ def cmd_embed(args):
 
 
 def cmd_search(args):
-    if args.technique == "hybrid":
+    if args.technique == "rerank":
         from app.techniques import best_retriever
 
         found = best_retriever(DATA_DIR).search(args.question, args.k)
+    elif args.technique == "hybrid":
+        from app.techniques import build_hybrid
+
+        found = build_hybrid(DATA_DIR).search(args.question, args.k)
     else:
         children, parents_by_id = load_chunks()
         retriever = load_retriever(args.store, args.model, children)
@@ -94,12 +103,12 @@ def cmd_search(args):
 
 def cmd_evaluate(args):
     children, parents_by_id = load_chunks()
-    questions = evaluation.load_test_questions(f"{DATA_DIR}/test_questions.json")
+    questions = load_questions(parents_by_id)
     print(f"{len(questions)} test questions")
     for store in chosen(args.store, STORES):
         for name in chosen(args.model, list(embeddings.MODELS)):
             retriever = load_retriever(store, name, children)
-            scores, _ = evaluation.evaluate(lambda q: parents_for(retriever.search(q), parents_by_id), questions)
+            scores, _ = evaluation.evaluate(lambda q: parents_for(retriever.search(q, 50), parents_by_id, k=10), questions)
             print(f"{store:7} {name:7} " + "  ".join(f"{k}: {v}" for k, v in scores.items()))
 
 
@@ -115,7 +124,7 @@ def compare_techniques(retrievers, questions):
             t: evaluation.score([d for d in details if d["type"] == t])["MRR"]
             for t in dict.fromkeys(d["type"] for d in details)
         }
-    overall = pd.DataFrame(rows).sort_values(["MRR", "correct in top 5"], ascending=False).reset_index(drop=True)
+    overall = pd.DataFrame(rows).sort_values(["MRR", "nDCG@5"], ascending=False).reset_index(drop=True)
     overall.index += 1
     return overall, pd.DataFrame(by_type).T.loc[overall["technique"]]
 
@@ -125,10 +134,27 @@ def cmd_compare(args):
 
     from app.techniques import build_techniques
 
-    questions = evaluation.load_test_questions(f"{DATA_DIR}/test_questions.json")
+    _, parents_by_id = load_chunks()
+    questions = load_questions(parents_by_id)
     overall, by_type = compare_techniques(build_techniques(DATA_DIR), questions)
     pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", None)
     print(f"{len(questions)} test questions\n\n{overall}\n\nMRR by question type:\n{by_type}")
+
+
+def cmd_rerank(args):
+    import pandas as pd
+
+    from app.reranker import build_rerankers
+    from app.techniques import build_hybrid
+
+    _, parents_by_id = load_chunks()
+    questions = load_questions(parents_by_id)
+    overall, by_type = compare_techniques(build_rerankers(build_hybrid(DATA_DIR), args.candidates), questions)
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", None)
+    print(f"{len(questions)} test questions, top {args.candidates} Hybrid results re-ranked\n\n{overall}"
+          f"\n\nMRR by question type:\n{by_type}")
 
 
 def main():
@@ -145,8 +171,9 @@ def main():
 
     search = commands.add_parser("search", help="find the passages that best answer a question")
     search.add_argument("question")
-    search.add_argument("--technique", default="hybrid", choices=["hybrid", "dense"],
-                        help="hybrid (the best in `compare`: mpnet + BM25) or dense only")
+    search.add_argument("--technique", default="rerank", choices=["rerank", "hybrid", "dense"],
+                        help="rerank (Hybrid + bge cross-encoder, the most accurate), hybrid (mpnet + BM25, "
+                             "fastest good option) or dense only")
     search.add_argument("--model", default="mpnet", choices=list(embeddings.MODELS), help="dense only")
     search.add_argument("--store", default="faiss", choices=STORES, help="dense only")
     search.add_argument("-k", type=int, default=3, help="how many passages to show")
@@ -159,6 +186,10 @@ def main():
 
     compare = commands.add_parser("compare", help="score the ten retrieval techniques on the test questions")
     compare.set_defaults(run=cmd_compare)
+
+    rerank = commands.add_parser("rerank", help="score Hybrid with and without each reranker on the test questions")
+    rerank.add_argument("--candidates", type=int, default=10, help="how many Hybrid results get re-scored")
+    rerank.set_defaults(run=cmd_rerank)
 
     args = parser.parse_args()
     args.run(args)
