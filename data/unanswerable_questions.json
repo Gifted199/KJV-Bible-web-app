@@ -1,0 +1,17 @@
+[
+  {"type": "off-topic", "question": "Who won the 2022 FIFA World Cup?"},
+  {"type": "off-topic", "question": "What is the capital of Australia?"},
+  {"type": "off-topic", "question": "How do I bake sourdough bread?"},
+  {"type": "off-topic", "question": "Who wrote the Harry Potter books?"},
+  {"type": "off-topic", "question": "What is the speed of light in a vacuum?"},
+  {"type": "off-topic", "question": "How do I write a list comprehension in Python?"},
+  {"type": "modern topic", "question": "What does Jesus say about smartphones?"},
+  {"type": "modern topic", "question": "What does the Bible say about the internet?"},
+  {"type": "modern topic", "question": "How many people visited the Vatican last year?"},
+  {"type": "not in the text", "question": "What was the name of Noah's wife?"},
+  {"type": "not in the text", "question": "What was the name of the Pharaoh in the book of Exodus?"},
+  {"type": "not in the text", "question": "What did Jesus do between the ages of 12 and 30?"},
+  {"type": "not in the text", "question": "In what year was the King James Version translated?"},
+  {"type": "false premise", "question": "Which Pope wrote the book of Revelation?"},
+  {"type": "not in the text", "question": "On what date of the year was Jesus born?"}
+]

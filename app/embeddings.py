@@ -145,3 +145,41 @@ def load_or_azure_embed(texts, out_dir, cache_name="azure_parents", client=None)
     vectors = azure_embed(texts, client, show_progress=True)
     np.save(path, vectors)
     return vectors
+
+
+class CachedQueryEncoder:
+    """Embed questions with Azure once, then reuse the saved vectors (a JSON file: question -> vector).
+
+    Evaluations ask the same questions again and again, so after the first run they make no embedding calls.
+    """
+
+    def __init__(self, path, embed=None):
+        import json
+
+        self.path = Path(path)
+        self.embed = embed or azure_embed  # texts -> array of vectors
+        self.vectors = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        self.calls = 0  # embedding requests made by this encoder
+
+    def prefetch(self, queries):
+        """Embed every question not yet cached, in one request."""
+        missing = list(dict.fromkeys(q for q in queries if q not in self.vectors))
+        if missing:
+            self.calls += 1
+            for query, vector in zip(missing, self.embed(missing)):
+                self.vectors[query] = [float(x) for x in vector]
+            self.save()
+
+    def save(self):
+        import json
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.vectors), encoding="utf-8")
+
+    def __call__(self, query):
+        self.prefetch([query])
+        return np.asarray(self.vectors[query], dtype=np.float32)
+
+
+def azure_query_encoder(out_dir):
+    return CachedQueryEncoder(embeddings_path(out_dir, "azure_queries", suffix=".json"))

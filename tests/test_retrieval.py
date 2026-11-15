@@ -110,11 +110,20 @@ def test_faiss_retriever_returns_closest_child_first():
     assert len(retriever.search("gamma", k=3)) == 3
 
 
-def test_chroma_retriever_matches_faiss():
-    import chromadb
+def chroma_client_or_skip():
+    """Chroma loads native libraries (gRPC) that some machines block, e.g. Windows Smart App Control."""
+    try:
+        import chromadb
 
+        return chromadb.EphemeralClient()
+    except (ImportError, OSError) as error:
+        pytest.skip(f"Chroma can't be loaded on this machine ({type(error).__name__}: {error})")
+
+
+def test_chroma_retriever_matches_faiss():
+    client = chroma_client_or_skip()
     children, vectors, encode = fake_store()
-    retriever = ChromaRetriever.build(chromadb.EphemeralClient(), "test_children", vectors, children, encode)
+    retriever = ChromaRetriever.build(client, "test_children", vectors, children, encode)
 
     for word in ["alpha", "beta", "gamma"]:
         assert retriever.search(word, k=1)[0]["id"] == FaissRetriever.build(vectors, children, encode).search(word, k=1)[0]["id"]

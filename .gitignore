@@ -13,3 +13,4 @@ wheels/
 data/*
 !data/test_questions.json
 .env
+!data/unanswerable_questions.json

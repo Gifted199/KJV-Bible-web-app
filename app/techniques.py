@@ -76,3 +76,21 @@ def build_techniques(data_dir="data"):
         "Multi-query": MultiQueryRetriever(parent_child),
         "Contextual": ParentChildRetriever(FaissRetriever.build(contextual_vectors, children, encode), parents_by_id),
     }
+
+
+def build_azure_hybrid(data_dir="data", encode=None):
+    """Azure AI Search hybrid (BM25 + text-embedding-3-small vectors, fused with RRF) over the kjv-parents index."""
+    from app import config
+    from app.azure_search import AzureSearchRetriever
+
+    parents_by_id = {p["id"]: p for p in read_jsonl(f"{data_dir}/parents.jsonl")}
+    encode = encode or embeddings.azure_query_encoder(data_dir)
+    return AzureSearchRetriever(config.search_client(), parents_by_id, encode)
+
+
+def best_azure_retriever(data_dir="data", encode=None, candidates=None):
+    """The deployed search: AI Search hybrid finds candidates, then the bge cross-encoder puts them in order."""
+    from app.reranker import CANDIDATES
+
+    return RerankRetriever(build_azure_hybrid(data_dir, encode), cross_encoder_scorer(CROSS_ENCODERS["bge"]),
+                           candidates or CANDIDATES)

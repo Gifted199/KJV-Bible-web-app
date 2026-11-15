@@ -31,6 +31,7 @@ KJV Rag/
 │   ├── evaluation.py            # precision@5, recall@5, MRR, nDCG@5
 │   ├── config.py                # Azure OpenAI, AI Search and Langfuse settings and clients, from .env
 │   ├── azure_search.py          # the kjv-parents index in Azure AI Search: create, upload, hybrid search
+│   ├── generation.py            # gpt-5.4-mini answers: strict JSON citations, quote checks, retry, abstention
 │   └── main.py                  # CLI: python -m app.main <command>
 ├── tests/                       # run offline: no model downloads, fake Azure clients
 ├── docs/PLAN.md                 # plan for generation, evaluation, guardrails, API, UI and deployment
@@ -75,7 +76,13 @@ uv run python -m app.main check          # test each cloud service (prints no se
 uv run python -m app.main azure-index    # embed the parents with text-embedding-3-small and upload to AI Search
 uv run python -m app.main azure-storage  # index size against the free-tier limit
 uv run python -m app.main azure-compare  # AI Search hybrid, with and without bge, beside the local Hybrid + bge
+uv run python -m app.main azure-depth    # bge re-scoring the top 10, 20 or 30 candidates
+uv run python -m app.main abstain-scores # best bge score, answerable vs unanswerable (the abstain threshold)
+uv run python -m app.main ask "Jonah is swallowed by a big fish"   # cited answer from gpt-5.4-mini, or abstain
+uv run python -m app.main ask "q1" "q2" --yes                       # a batch prints its estimate; --yes runs it
 ```
+
+Each answer is logged with its citations, tokens, cost and time to `data/runs/answers.jsonl`.
 
 `search` takes `--technique rerank` (the default, most accurate, about 3 seconds per question on a CPU), `--technique hybrid` (about 0.05 seconds) or `--technique dense`. The first search also loads the models, which takes about 30 seconds.
 
@@ -294,6 +301,38 @@ MRR by question type:
 - Indexing the 14,618 children as well would not fit, which is why the parents were indexed.
 
 **Cost:** embedding the corpus took 1.17 million tokens, about $0.02. It took 12 minutes because the deployment's rate limit is 99,000 tokens per minute.
+
+### 6. Rerank depth: bge re-scores the top 10
+
+How many AI Search candidates should bge re-score? The 54 question embeddings came from the cache, so the run made no new embedding calls apart from one first-time request.
+
+| Candidates re-scored | MRR | #1 | Top 5 | Seconds per question |
+|---|---|---|---|---|
+| **Top 10 (kept)** | **0.927** | **48** | **53** | 6.97 |
+| Top 20 | 0.927 | 48 | 53 | 12.75 |
+| Top 30 | 0.924 | 48 | 53 | 12.13 |
+
+- **Going deeper adds nothing.** Every passage bge moves up is already in AI Search's top 10. Top 20 and top 30 only add time.
+- **Top 10 is the smallest depth tested, so it stays the default** (`reranker.CANDIDATES`).
+- **The times are noisy on a laptop.** Top 10 took 4.23 seconds per question in section 5 but 6.97 here, and top 30 came out faster than top 20. The scores don't depend on timing.
+
+### 7. Abstaining before the LLM: threshold 0.01
+
+If bge's best score is below the threshold, the app abstains without calling the LLM. To pick the threshold, the best score was measured for the 54 answerable questions and for 15 the Bible can't answer (`data/unanswerable_questions.json`):
+
+| Best bge score | Answerable (54) | Unanswerable (15) |
+|---|---|---|
+| below 0.001 | 0 | 8 |
+| 0.001 – 0.01 | 0 | 2 |
+| 0.01 – 0.03 | 0 | 2 |
+| 0.03 – 0.1 | 3 | 1 |
+| 0.1 – 0.3 | 4 | 1 |
+| 0.3 – 1 | 47 | 1 |
+
+- **The lowest answerable score is 0.046** ("What is love? Love is patient and kind"). Even an exact quote, "The Lord is my shepherd; I shall not want", scores only 0.059.
+- **At 0.01, no answerable question is lost, and 10 of the 15 unanswerable questions are stopped before the LLM.** These are all the off-topic and modern questions, at no cost.
+- **Why not a higher threshold:** 0.03 would stop two more, but it would sit only 1.5 times below the lowest answerable score. 0.01 leaves a 4.6 times margin for real users' wording.
+- **What gets past the threshold:** the remaining 5 unanswerable questions pass it because their passages are close to the topic. For example, "What was the name of Noah's wife?" scores 0.46 on the Noah passages. They are left to the second layer: the LLM is told to abstain when the passages don't answer the question.
 
 ## Tests
 
