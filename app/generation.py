@@ -21,7 +21,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from app import config
+from app import config, tracing
 
 TOP_PASSAGES = 5  # what the LLM reads, the K of precision@5
 MAX_COMPLETION_TOKENS = 1500
@@ -142,6 +142,7 @@ class Answer:
     problems: list = field(default_factory=list)  # citation problems of the last attempt
     usage: Usage = field(default_factory=Usage)
     seconds: float = 0.0
+    trace_id: str | None = None  # Langfuse trace, when tracing is on
 
     @property
     def text(self):
@@ -158,6 +159,7 @@ def call_model(client, deployment, messages, passage_ids):
     response = client.chat.completions.create(
         model=deployment, messages=messages, response_format=answer_schema(passage_ids),
         **config.chat_options(MAX_COMPLETION_TOKENS, reasoning_effort="none", temperature=0),
+        **tracing.llm_kwargs("gpt-5.4-mini answer"),
     )
     choice = response.choices[0]
     raw = choice.message.content or ""
@@ -172,15 +174,47 @@ def call_model(client, deployment, messages, passage_ids):
 
 
 def answer_question(question, retriever, client=None, deployment=None, threshold=ABSTAIN_THRESHOLD, k=TOP_PASSAGES):
-    """Search, then answer with verified citations or abstain. retriever.search_with_scores gives (passage, score)."""
+    """Search, then answer with verified citations or abstain. retriever.search_with_scores gives (passage, score).
+
+    The whole run is one Langfuse trace (when tracing is on); answer.trace_id is its id.
+    """
+    with tracing.trace("kjv-answer", input={"question": question}, tags=["phase-3"]) as root:
+        result = _answer(question, retriever, client, deployment, threshold, k)
+        result.trace_id = root.trace_id
+        root.update(output={"answer": result.text, "abstained": result.abstained, "reason": result.reason,
+                            "parts": result.parts},
+                    metadata={"top_score": result.top_score, "passages": len(result.passages),
+                              "attempts": result.attempts, "seconds": round(result.seconds, 3),
+                              "cost_usd": round(result.usage.cost, 6), "threshold": threshold})
+        root.score_trace(name="abstained", value=float(result.abstained), data_type="BOOLEAN",
+                         comment=result.reason)
+        root.score_trace(name="top_bge_score", value=result.top_score)
+        root.score_trace(name="passages", value=len(result.passages))
+        root.score_trace(name="llm_calls", value=result.usage.calls)
+        root.score_trace(name="cost_usd", value=result.usage.cost)
+        root.score_trace(name="latency_seconds", value=result.seconds)
+        if result.usage.calls:
+            root.score_trace(name="citation_checks_passed", value=float(not result.problems), data_type="BOOLEAN")
+    return result
+
+
+def _answer(question, retriever, client, deployment, threshold, k):
     start = time.perf_counter()
+    with tracing.span("input-guard", as_type="guardrail", input={"question": question},
+                      metadata={"placeholder": True}) as span:
+        span.update(output={"passed": True, "note": "placeholder until phase 5 (guardrails)"})
+
     ranked = retriever.search_with_scores(question, k)
     passages = [p for p, _ in ranked]
     result = Answer(question, abstained=True, reason="",
                     passages=[{"id": p["id"], "reference": p["reference"], "score": round(float(s), 4)} for p, s in ranked],
                     top_score=float(ranked[0][1]) if ranked else 0.0)
 
-    if result.top_score < threshold:
+    with tracing.span("abstention-check", as_type="guardrail",
+                      input={"top_score": result.top_score, "threshold": threshold}) as span:
+        below = result.top_score < threshold
+        span.update(output={"abstain": below, "passages": len(passages)})
+    if below:
         result.reason = f"retrieval: best passage score {result.top_score:.4f} is below the threshold {threshold}"
         result.seconds = time.perf_counter() - start
         return result
@@ -191,9 +225,13 @@ def answer_question(question, retriever, client=None, deployment=None, threshold
     messages = build_messages(question, passages)
     for attempt in (1, 2):
         result.attempts = attempt
-        reply, problem, raw, usage = call_model(client, deployment, messages, list(passages_by_id))
+        with tracing.span("generation", metadata={"attempt": attempt, "deployment": deployment}) as span:
+            reply, problem, raw, usage = call_model(client, deployment, messages, list(passages_by_id))
+            span.update(output=reply if reply is not None else {"problem": problem})
         result.usage.add(usage)
-        result.problems = [problem] if problem else check_citations(reply, passages_by_id)
+        with tracing.span("citation-verification", as_type="guardrail", metadata={"attempt": attempt}) as span:
+            result.problems = [problem] if problem else check_citations(reply, passages_by_id)
+            span.update(output={"passed": not result.problems, "problems": result.problems})
         if reply is not None and reply["abstained"]:
             result.reason = "model: the passages don't answer the question"
             break

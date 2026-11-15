@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 
 EMBED_DIMENSIONS = 1536  # text-embedding-3-small at full size
 LANGFUSE_EU = "https://cloud.langfuse.com"
+#seconds; without them a request that loses its connection (e.g. the laptop sleeps) can wait for hours, not retry
+SEARCH_TIMEOUTS = {"connection_timeout": 10, "read_timeout": 30}
 
 GROUPS = {
     "openai": ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_CHAT_DEPLOYMENT",
@@ -99,8 +101,16 @@ def embed_deployment():
 
 @cache
 def openai_client():
-    """One client for both deployments: they share the resource, endpoint and key."""
-    from openai import OpenAI
+    """One client for both deployments: they share the resource, endpoint and key.
+
+    With tracing on it is Langfuse's drop-in OpenAI client, which records every call's tokens and cost.
+    """
+    from app import tracing
+
+    if tracing.enabled():
+        from langfuse.openai import OpenAI
+    else:
+        from openai import OpenAI
 
     s = require("openai")
     return OpenAI(base_url=f"{base_endpoint(s['AZURE_OPENAI_ENDPOINT'])}/openai/v1/", api_key=s["AZURE_OPENAI_API_KEY"])
@@ -117,7 +127,7 @@ def search_index_client():
     from azure.search.documents.indexes import SearchIndexClient
 
     s = require("search")
-    return SearchIndexClient(s["AZURE_SEARCH_ENDPOINT"], AzureKeyCredential(s["AZURE_SEARCH_API_KEY"]))
+    return SearchIndexClient(s["AZURE_SEARCH_ENDPOINT"], AzureKeyCredential(s["AZURE_SEARCH_API_KEY"]), **SEARCH_TIMEOUTS)
 
 
 @cache
@@ -127,7 +137,8 @@ def search_client():
     from azure.search.documents import SearchClient
 
     s = require("search")
-    return SearchClient(s["AZURE_SEARCH_ENDPOINT"], s["AZURE_SEARCH_INDEX"], AzureKeyCredential(s["AZURE_SEARCH_API_KEY"]))
+    return SearchClient(s["AZURE_SEARCH_ENDPOINT"], s["AZURE_SEARCH_INDEX"], AzureKeyCredential(s["AZURE_SEARCH_API_KEY"]),
+                        **SEARCH_TIMEOUTS)
 
 
 def langfuse_base_url():
@@ -140,8 +151,10 @@ def langfuse_client():
     from langfuse import Langfuse
 
     s = require("langfuse")
+    from app.tracing import mask
+
     return Langfuse(public_key=s["LANGFUSE_PUBLIC_KEY"], secret_key=s["LANGFUSE_SECRET_KEY"],
-                    base_url=langfuse_base_url())
+                    base_url=langfuse_base_url(), mask=mask)
 
 
 def check_chat():

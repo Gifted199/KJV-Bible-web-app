@@ -145,3 +145,43 @@ def test_query_cache_embeds_each_question_once(tmp_path):
     again = embeddings.CachedQueryEncoder(tmp_path / "q.json", embed=fake_embed)
     again("b")
     assert seen == ["a", "b"] and encode.calls == 1 and again.calls == 0
+
+
+def test_tracing_is_off_in_tests_and_its_functions_do_nothing():
+    from app import tracing
+
+    assert not tracing.enabled()
+    with tracing.trace("t") as root, tracing.span("s") as span:
+        span.update(output=1)
+        root.score_trace(name="x", value=1)
+    assert root.trace_id is None and tracing.llm_kwargs("name") == {}
+    assert ask(FakeLLM(reply([], abstained=True))).trace_id is None
+
+
+def test_tracing_switch_and_secret_mask(monkeypatch):
+    from app import tracing
+
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-secret-value-123")
+    monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "true")
+    assert tracing.enabled()
+    monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "false")
+    assert not tracing.enabled()
+    masked = tracing.mask(data={"note": ["key sk-secret-value-123 leaked"], "n": 3})
+    assert masked == {"note": ["key *** leaked"], "n": 3}
+
+
+def test_spans_outside_a_trace_record_nothing(monkeypatch):
+    from app import config, tracing
+
+    class FakeLangfuse:
+        def get_current_trace_id(self):
+            return None  # no question trace is open
+
+        def start_as_current_observation(self, **kwargs):
+            raise AssertionError("a loose span was created")
+
+    monkeypatch.setattr(tracing, "enabled", lambda: True)
+    monkeypatch.setattr(config, "langfuse_client", lambda: FakeLangfuse())
+    with tracing.span("ai-search") as span:
+        assert span.trace_id is None

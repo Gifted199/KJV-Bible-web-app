@@ -32,6 +32,7 @@ KJV Rag/
 │   ├── config.py                # Azure OpenAI, AI Search and Langfuse settings and clients, from .env
 │   ├── azure_search.py          # the kjv-parents index in Azure AI Search: create, upload, hybrid search
 │   ├── generation.py            # gpt-5.4-mini answers: strict JSON citations, quote checks, retry, abstention
+│   ├── tracing.py               # Langfuse: one trace per question, a span per step, keys masked
 │   └── main.py                  # CLI: python -m app.main <command>
 ├── tests/                       # run offline: no model downloads, fake Azure clients
 ├── docs/PLAN.md                 # plan for generation, evaluation, guardrails, API, UI and deployment
@@ -80,6 +81,7 @@ uv run python -m app.main azure-depth    # bge re-scoring the top 10, 20 or 30 c
 uv run python -m app.main abstain-scores # best bge score, answerable vs unanswerable (the abstain threshold)
 uv run python -m app.main ask "Jonah is swallowed by a big fish"   # cited answer from gpt-5.4-mini, or abstain
 uv run python -m app.main ask "q1" "q2" --yes                       # a batch prints its estimate; --yes runs it
+uv run python -m app.main langfuse-datasets  # upload the test questions as Langfuse datasets
 ```
 
 Each answer is logged with its citations, tokens, cost and time to `data/runs/answers.jsonl`.
@@ -268,33 +270,40 @@ The deployed app uses managed Azure services, so the local search was rebuilt on
 - **Embeddings:** Azure OpenAI `text-embedding-3-small`, 1,536 dimensions, replacing mpnet.
 - **Index:** `kjv-parents` in **Azure AI Search, free tier**.
   - **Contents:** one document per parent passage (4,723 documents).
-  - **Fields:** keyword fields scored with BM25, and an HNSW vector field.
+  - **Fields:** keyword fields scored with BM25, and a vector field searched **exhaustively** (exact search, see below).
   - **Hybrid search:** runs both and fuses them with reciprocal rank fusion, like the local Hybrid.
 
 | | P@5 | R@5 | MRR | nDCG@5 | #1 | Top 5 | Seconds per question |
 |---|---|---|---|---|---|---|---|
-| **Local Hybrid + bge** (baseline) | **0.307** | **0.963** | **0.945** | **0.930** | **49** | **54** | 4.26 |
-| **AI Search hybrid + bge** (chosen) | 0.293 | 0.927 | 0.927 | 0.902 | 48 | 53 | 4.23 |
-| Local Hybrid, no reranker | 0.296 | 0.933 | 0.874 | 0.865 | 42 | 53 | 0.08 |
-| AI Search hybrid, no reranker | 0.300 | 0.948 | 0.801 | 0.811 | 36 | 54 | 0.31 |
+| **AI Search hybrid + bge** (chosen) | 0.296 | 0.946 | **0.946** | 0.921 | **49** | **54** | 3.63 |
+| Local Hybrid + bge (baseline) | **0.307** | **0.963** | 0.945 | **0.930** | **49** | **54** | 3.73 |
+| Local Hybrid, no reranker | 0.296 | 0.933 | 0.874 | 0.865 | 42 | 53 | 0.09 |
+| AI Search hybrid, no reranker | 0.300 | 0.948 | 0.801 | 0.811 | 36 | 54 | 0.09 |
 
 MRR by question type:
 
 | | Quote | Paraphrase | Names a book | Topic |
 |---|---|---|---|---|
+| AI Search hybrid + bge | **1.000** | **0.912** | 0.903 | **1.000** |
 | Local Hybrid + bge | **1.000** | 0.910 | 0.903 | **1.000** |
-| AI Search hybrid + bge | 0.938 | **0.912** | 0.903 | **1.000** |
 | Local Hybrid, no reranker | 0.944 | 0.787 | **0.958** | 0.806 |
 | AI Search hybrid, no reranker | 0.846 | 0.737 | 0.806 | 0.889 |
 
 **Why bge stays:**
 - **Without bge, AI Search is the weakest of the four.** It finds the right passages: recall@5 is 0.948, and all 54 questions have one in the top 5. But it often ranks them lower, so only 36 of 54 are at #1.
-- **bge fixes the order.** MRR rises from 0.801 to 0.927, and 12 more questions get the right passage first.
-- **The time is almost all bge.** AI Search on its own takes 0.31 seconds (embedding the question plus the search). bge adds about 4 seconds on this laptop's CPU, the same as in the local pipeline.
+- **bge fixes the order.** MRR rises from 0.801 to 0.946, and 13 more questions get the right passage first.
+- **The time is almost all bge.** AI Search on its own takes about 0.1 seconds with a cached question embedding. bge adds about 3.5 seconds on this laptop's CPU, the same as in the local pipeline.
 
-**How close Azure is to the local baseline:**
-- AI Search + bge is one question behind at #1 (48 vs 49) and one behind in the top 5 (53 vs 54).
-- On 54 questions that difference is too small to call: it could change with another set of questions.
+**Azure matches the local baseline:**
+- Both get the right passage first for 49 of the 54 questions, and into the top 5 for all 54.
+- MRR is 0.946 against 0.945. The local baseline is slightly higher on precision@5, recall@5 and nDCG@5, meaning a few more of the extra relevant passages reach the top 5.
+
+**Why exact vector search:**
+- AI Search's default HNSW vector search is approximate, and it gave **different results for the same query.**
+  - For "The Lord is my shepherd; I shall not want", Psalm 23 was missing from the hybrid top 10 in 10 of 12 runs.
+  - With exhaustive search, it was #1 in all 12 runs.
+- **There's no speed cost:** both took about 46 ms per search on the 4,723 vectors.
+- The first Azure measurements, which reported MRR 0.927, used HNSW and were replaced by the run above.
 
 **Storage on the free tier:**
 - The index uses **40.8 MB of the 52.4 MB limit (78%)**. Azure also reports a separate vector index size of 87.8 MB, with no quota shown.
@@ -304,17 +313,17 @@ MRR by question type:
 
 ### 6. Rerank depth: bge re-scores the top 10
 
-How many AI Search candidates should bge re-score? The 54 question embeddings came from the cache, so the run made no new embedding calls apart from one first-time request.
+How many AI Search candidates should bge re-score? All 54 question embeddings came from the cache, so the run made no embedding calls.
 
 | Candidates re-scored | MRR | #1 | Top 5 | Seconds per question |
 |---|---|---|---|---|
-| **Top 10 (kept)** | **0.927** | **48** | **53** | 6.97 |
-| Top 20 | 0.927 | 48 | 53 | 12.75 |
-| Top 30 | 0.924 | 48 | 53 | 12.13 |
+| **Top 10 (kept)** | **0.946** | **49** | **54** | **4.07** |
+| Top 20 | 0.946 | 49 | 54 | 5.98 |
+| Top 30 | 0.943 | 49 | 54 | 13.25 |
 
-- **Going deeper adds nothing.** Every passage bge moves up is already in AI Search's top 10. Top 20 and top 30 only add time.
+- **Going deeper adds nothing.** Every passage bge moves up is already in AI Search's top 10. Top 30 is even slightly worse, and three times slower.
 - **Top 10 is the smallest depth tested, so it stays the default** (`reranker.CANDIDATES`).
-- **The times are noisy on a laptop.** Top 10 took 4.23 seconds per question in section 5 but 6.97 here, and top 30 came out faster than top 20. The scores don't depend on timing.
+- **Timings vary on a laptop by about ±1 second.** The scores don't change from run to run.
 
 ### 7. Abstaining before the LLM: threshold 0.01
 
@@ -325,14 +334,49 @@ If bge's best score is below the threshold, the app abstains without calling the
 | below 0.001 | 0 | 8 |
 | 0.001 – 0.01 | 0 | 2 |
 | 0.01 – 0.03 | 0 | 2 |
-| 0.03 – 0.1 | 3 | 1 |
+| 0.03 – 0.1 | 2 | 1 |
 | 0.1 – 0.3 | 4 | 1 |
-| 0.3 – 1 | 47 | 1 |
+| 0.3 – 1 | 48 | 1 |
 
-- **The lowest answerable score is 0.046** ("What is love? Love is patient and kind"). Even an exact quote, "The Lord is my shepherd; I shall not want", scores only 0.059.
+- **The lowest answerable score is 0.046** ("What is love? Love is patient and kind", where the KJV says "charity suffereth long, and is kind"). A paraphrase in modern words scores low even when the right passage is found.
 - **At 0.01, no answerable question is lost, and 10 of the 15 unanswerable questions are stopped before the LLM.** These are all the off-topic and modern questions, at no cost.
 - **Why not a higher threshold:** 0.03 would stop two more, but it would sit only 1.5 times below the lowest answerable score. 0.01 leaves a 4.6 times margin for real users' wording.
 - **What gets past the threshold:** the remaining 5 unanswerable questions pass it because their passages are close to the topic. For example, "What was the name of Noah's wife?" scores 0.46 on the Noah passages. They are left to the second layer: the LLM is told to abstain when the passages don't answer the question.
+
+## Tracing with Langfuse
+
+Every question asked with `python -m app.main ask` becomes **one trace** in Langfuse Cloud (EU), with a child span for each step:
+
+| Span | Records |
+|---|---|
+| `input-guard` | Placeholder until the guardrails phase: always passes |
+| `question-embedding` | Whether the vector came from the cache. On a cache miss, the embedding call, with its tokens |
+| `ai-search` | The hybrid query and the candidates with their fused scores |
+| `bge-rerank` | The candidates re-scored by bge, best first |
+| `abstention-check` | The best bge score against the threshold |
+| `generation` | The gpt-5.4-mini call. Langfuse's OpenAI integration records tokens and cost. There are two spans on a retry |
+| `citation-verification` | Whether every quote passed, and the problems if not |
+
+**Scores on each trace:**
+- `abstained`
+- `top_bge_score`
+- `passages`
+- `llm_calls`
+- `cost_usd`
+- `latency_seconds`
+- `citation_checks_passed`, when the LLM was called
+
+**Prices:** Langfuse already has managed prices for `gpt-5.4-mini` ($0.75 / $4.50 per million tokens) and `text-embedding-3-small`, so it shows costs without a custom model definition.
+
+**Switching it off:**
+- Tracing is on when the Langfuse keys are set, and off with `LANGFUSE_TRACING_ENABLED=false`.
+- The tests always switch it off.
+- Only `ask` traces. Evaluation and indexing commands run with tracing off, so their hundreds of calls don't fill Langfuse.
+- Spans are recorded only inside a question's trace.
+
+**Keys are never sent:** every value passes through a mask that replaces any secret from `.env` before it leaves the machine.
+
+**Datasets:** `python -m app.main langfuse-datasets` uploads the test questions as two Langfuse datasets, `kjv-answerable` (54 items, with their answer verses) and `kjv-unanswerable` (15 items, expected to abstain). Item IDs are fixed, so running it again updates the items rather than duplicating them.
 
 ## Tests
 

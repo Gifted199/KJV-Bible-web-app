@@ -19,6 +19,10 @@ VECTOR_FIELD = "vector"
 VECTOR_PROFILE = "kjv-hnsw"
 UPLOAD_BATCH = 200  # documents per request (~3 MB of JSON), well under the 16 MB request limit
 DEPTH = 50  # results taken from each of keyword and vector search before fusing, as in the local Hybrid
+#exact vector search over all 4,723 vectors instead of the approximate HNSW graph: HNSW returned different results for
+#the same query (Psalm 23 missing from "The Lord is my shepherd" in 10 of 12 hybrid runs); exact search was
+#identical every time and just as fast (~46 ms), because the index is small
+EXHAUSTIVE = True
 VALID_KEY = re.compile(r"^[A-Za-z0-9_\-=]+$")  # the characters Azure allows in a document key
 QUERY_OPERATORS = re.compile(r'[+\-&|!(){}\[\]^"~*?:\\/]')  # characters with a meaning in the query syntax
 
@@ -142,15 +146,24 @@ class AzureSearchRetriever:
     def search_with_scores(self, query, k=10):
         from azure.search.documents.models import VectorizedQuery
 
+        from app import tracing
+
         options = {"top": k, "select": ["id"]}
         if self.mode != "keyword":
-            vector = [float(x) for x in self.encode(query)]
+            cached = query in getattr(self.encode, "vectors", {})
+            with tracing.span("question-embedding", input=query, metadata={"cached": cached}) as span:
+                vector = [float(x) for x in self.encode(query)]
+                span.update(output={"dimensions": len(vector), "from cache": cached})
             neighbours = max(k, self.depth) if self.mode == "hybrid" else k
             options["vector_queries"] = [VectorizedQuery(vector=vector, k_nearest_neighbors=neighbours,
-                                                         fields=VECTOR_FIELD)]
+                                                         fields=VECTOR_FIELD, exhaustive=EXHAUSTIVE)]
         search_text = clean_query(query) if self.mode != "vector" else None
-        results = self.client.search(search_text=search_text, **options)
-        return [(self.parents_by_id[r["id"]], r["@search.score"]) for r in results]
+        with tracing.span("ai-search", as_type="retriever", input={"search_text": search_text, "top": k},
+                          metadata={"mode": self.mode, "index": getattr(self.client, "_index_name", None)}) as span:
+            results = [(self.parents_by_id[r["id"]], r["@search.score"])
+                       for r in self.client.search(search_text=search_text, **options)]
+            span.update(output=[{"reference": p["reference"], "score": round(s, 5)} for p, s in results])
+        return results
 
     def search(self, query, k=10):
         return [parent for parent, _ in self.search_with_scores(query, k)]

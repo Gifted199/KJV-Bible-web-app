@@ -94,6 +94,7 @@ def test_hybrid_sends_words_and_vector_and_returns_local_parents():
     call = client.calls[0]
     assert call["search_text"] == "Jesus wept"
     assert call["vector_queries"][0].k_nearest_neighbors == azure_search.DEPTH
+    assert call["vector_queries"][0].exhaustive is True  # exact search: HNSW results varied between runs
 
 
 def test_keyword_and_vector_modes_send_only_their_part():

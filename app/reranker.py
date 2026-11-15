@@ -51,6 +51,7 @@ def cross_encoder_scorer(model_name):
         pairs = [(question, text) for text in texts]
         return load_cross_encoder(model_name).predict(pairs, batch_size=1).tolist()
 
+    scores.model_name = model_name
     return scores
 
 
@@ -63,11 +64,17 @@ class RerankRetriever:
         self.candidates = candidates
 
     def search_with_scores(self, query, k=10):
+        from app import tracing
+
         items = self.base.search(query, self.candidates)
         if not items:
             return []
-        scores = self.scorer(query, [item["text"] for item in items])
-        ranked = sorted(zip(items, scores), key=lambda pair: pair[1], reverse=True)
+        with tracing.span("bge-rerank", input={"candidates": [item["reference"] for item in items if "reference" in item]},
+                          metadata={"model": getattr(self.scorer, "model_name", "custom"), "keep": k}) as span:
+            scores = self.scorer(query, [item["text"] for item in items])
+            ranked = sorted(zip(items, scores), key=lambda pair: pair[1], reverse=True)
+            span.update(output=[{"reference": item.get("reference"), "score": round(float(s), 4)}
+                                for item, s in ranked[:k]])
         return ranked[:k]
 
     def search(self, query, k=10):

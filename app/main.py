@@ -13,6 +13,9 @@
     azure-depth                  score AI Search hybrid + bge re-scoring the top 10, 20 or 30 candidates
     abstain-scores               best bge score of answerable vs unanswerable questions (sets the abstain threshold)
     ask      "question" ...      answer with verse citations (gpt-5.4-mini) or abstain; a batch needs --yes
+    langfuse-datasets            upload the answerable and unanswerable questions as Langfuse datasets
+
+Result tables are saved to data/runs/*.csv, which the notebook reads.
 """
 
 import argparse
@@ -31,6 +34,7 @@ from app.dense_retriever import (
 
 DATA_DIR = "data"
 EMBED_PRICE_PER_MILLION = 0.02  # text-embedding-3-small list price, US$ per million tokens
+TRACED_COMMANDS = {"ask"}  # one Langfuse trace per question; every other command runs with tracing off
 STORES = ["faiss", "chroma"]
 
 
@@ -55,6 +59,20 @@ def load_retriever(store, model_name, children):
     if store == "faiss":
         return FaissRetriever.load(faiss_index_path(DATA_DIR, model_name), children, encode)
     return ChromaRetriever.load(chroma_client(), chroma_collection_name(model_name), children, encode)
+
+
+def save_results(name, table, note=None):
+    """Save a result table to data/runs/<name>.csv (plus when it was saved), so the notebook reads it instead of
+    re-running the experiment."""
+    import json
+    from pathlib import Path
+
+    folder = Path(DATA_DIR) / "runs"
+    folder.mkdir(parents=True, exist_ok=True)
+    table.to_csv(folder / f"{name}.csv", index=True)
+    meta = {"saved": time.strftime("%Y-%m-%dT%H:%M:%S"), **({"note": note} if note else {})}
+    (folder / f"{name}.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"saved {folder / f'{name}.csv'}")
 
 
 def chosen(value, options):
@@ -155,6 +173,8 @@ def cmd_compare(args):
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", None)
     print(f"{len(questions)} test questions\n\n{overall}\n\nMRR by question type:\n{by_type}")
+    save_results("compare", overall)
+    save_results("compare_by_type", by_type)
 
 
 def cmd_rerank(args):
@@ -166,6 +186,8 @@ def cmd_rerank(args):
     _, parents_by_id = load_chunks()
     questions = load_questions(parents_by_id)
     overall, by_type = compare_techniques(build_rerankers(build_hybrid(DATA_DIR), args.candidates), questions)
+    save_results("rerank", overall, f"top {args.candidates} candidates")
+    save_results("rerank_by_type", by_type)
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", None)
     print(f"{len(questions)} test questions, top {args.candidates} Hybrid results re-ranked\n\n{overall}"
@@ -234,7 +256,7 @@ def cmd_azure_compare(args):
     questions = load_questions(parents_by_id)
     bge = cross_encoder_scorer(CROSS_ENCODERS["bge"])
     local = build_hybrid(DATA_DIR)
-    azure = AzureSearchRetriever(config.search_client(), parents_by_id, embeddings.azure_encoder())
+    azure = AzureSearchRetriever(config.search_client(), parents_by_id, embeddings.azure_query_encoder(DATA_DIR))
     retrievers = {
         "Local Hybrid (mpnet + BM25)": local,
         "Local Hybrid + bge": RerankRetriever(local, bge),
@@ -245,6 +267,8 @@ def cmd_azure_compare(args):
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", None)
     print(f"{len(questions)} test questions\n\n{overall}\n\nMRR by question type:\n{by_type}")
+    save_results("azure_compare", overall)
+    save_results("azure_compare_by_type", by_type)
 
 
 def cmd_azure_depth(args):
@@ -263,6 +287,7 @@ def cmd_azure_depth(args):
                   for d in depths}
     overall, _ = compare_techniques(retrievers, questions)
     overall = overall.set_index("technique").loc[list(retrievers)]
+    save_results("azure_depth", overall)
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", None)
     print(f"{len(questions)} test questions, AI Search hybrid + bge; question embedding requests this run: "
@@ -312,6 +337,11 @@ def cmd_abstain_scores(args):
     print("unanswerable, highest first:")
     for score, q in sorted(groups["unanswerable"], key=lambda pair: pair[0], reverse=True):
         print(f"  {score:.4f}  [{q['type']}] {q['question']}")
+    import pandas as pd
+
+    rows = [{"group": name, "type": q["type"], "question": q["question"], "best_score": round(float(score), 6)}
+            for name, scored in groups.items() for score, q in scored]
+    save_results("abstain_scores", pd.DataFrame(rows).set_index("question"))
     t = args.threshold if args.threshold is not None else ABSTAIN_THRESHOLD
     lost = sum(s < t for s, _ in groups["answerable"])
     caught = sum(s < t for s, _ in groups["unanswerable"])
@@ -335,6 +365,8 @@ def print_answer(answer):
           f"${u.cost:.5f} | {answer.seconds:.1f}s")
     if answer.problems:
         print(f"   last citation problems: {answer.problems}")
+    if answer.trace_id:
+        print(f"   Langfuse trace: {answer.trace_id}")
 
 
 def cmd_ask(args):
@@ -348,12 +380,17 @@ def cmd_ask(args):
         if not args.yes:
             print("not run: add --yes to run it")
             return
+    from app import tracing
+
+    print(f"tracing: {'on (Langfuse)' if tracing.enabled() else 'off'}")
     retriever = best_azure_retriever(DATA_DIR)
     total = generation.Usage()
+    trace_ids = []
     for question in args.questions:
         answer = generation.answer_question(question, retriever)
         generation.append_log(answer, args.log)
         print_answer(answer)
+        trace_ids.append(answer.trace_id)
         total.calls += answer.usage.calls
         total.input_tokens += answer.usage.input_tokens
         total.cached_input_tokens += answer.usage.cached_input_tokens
@@ -362,6 +399,35 @@ def cmd_ask(args):
     if len(args.questions) > 1:
         print(f"\ntotal: {total.calls} LLM calls, {total.input_tokens} tokens in, {total.output_tokens} out, "
               f"${total.cost:.5f}; logged to {args.log}")
+    if any(trace_ids):
+        print("Langfuse trace ids:\n  " + "\n  ".join(t for t in trace_ids if t))
+
+
+def cmd_langfuse_datasets(args):
+    """Upload the test questions as two Langfuse datasets. Item ids are fixed, so running it again updates them."""
+    from app import config
+
+    _, parents_by_id = load_chunks()
+    answerable = load_questions(parents_by_id)
+    unanswerable = load_unanswerable()
+    lf = config.langfuse_client()
+    sets = {
+        "kjv-answerable": ("The 54 retrieval test questions with the verses that answer them",
+                           [{"input": {"question": q["question"]}, "expected_output": {"answers": q["answers"]},
+                             "metadata": {"type": q["type"]}} for q in answerable]),
+        "kjv-unanswerable": ("15 questions the KJV text cannot answer: the app should abstain",
+                             [{"input": {"question": q["question"]}, "expected_output": {"abstain": True},
+                               "metadata": {"type": q["type"]}} for q in unanswerable]),
+    }
+    for name, (description, items) in sets.items():
+        try:
+            lf.get_dataset(name)
+        except Exception:  # not created yet
+            lf.create_dataset(name=name, description=description)
+        for number, item in enumerate(items, start=1):
+            lf.create_dataset_item(dataset_name=name, id=f"{name}-{number:02d}", **item)
+        print(f"{name}: {len(items)} items")
+    lf.flush()
 
 
 def main():
@@ -426,9 +492,19 @@ def main():
     ask.add_argument("--log", default=f"{DATA_DIR}/runs/answers.jsonl")
     ask.set_defaults(run=cmd_ask)
 
+    datasets = commands.add_parser("langfuse-datasets", help="upload the test questions as Langfuse datasets")
+    datasets.set_defaults(run=cmd_langfuse_datasets)
+
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # KJV quotes use curly apostrophes
     args = parser.parse_args()
-    args.run(args)
+    from app import tracing
+
+    if args.command not in TRACED_COMMANDS:
+        tracing.disable()  # evaluations and indexing make hundreds of calls that aren't user questions
+    try:
+        args.run(args)
+    finally:
+        tracing.flush()  # send buffered traces before the process exits
 
 
 if __name__ == "__main__":
