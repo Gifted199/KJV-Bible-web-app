@@ -12,3 +12,4 @@ wheels/
 # Data: the PDF and everything generated from it stay local; the test questions are committed
 data/*
 !data/test_questions.json
+.env

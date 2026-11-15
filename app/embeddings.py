@@ -99,3 +99,49 @@ def load_or_sparse_embed(texts, out_dir, cache_name="splade_parents"):
     vectors = sparse_embed_documents(texts, show_progress_bar=True)
     scipy.sparse.save_npz(path, vectors)
     return vectors
+
+
+#Azure OpenAI text-embedding-3-small: 1,536 dimensions, already normalized to length 1 (so dot product = cosine)
+AZURE_BATCH = 100  # texts per request (~25,000 tokens for the parents), far below the API's per-request limits
+AZURE_TOKENIZER = "cl100k_base"
+
+
+def count_tokens(texts):
+    """Tokens text-embedding-3-small will be billed for."""
+    import tiktoken
+
+    encoding = tiktoken.get_encoding(AZURE_TOKENIZER)
+    return sum(len(encoding.encode(t)) for t in texts)
+
+
+def azure_embed(texts, client=None, deployment=None, batch_size=AZURE_BATCH, show_progress=False):
+    """Embed with the Azure deployment, in batches. Row i is the vector for texts[i]."""
+    from app import config
+
+    client = client or config.openai_client().with_options(max_retries=8)  # retry rate limits with backoff
+    deployment = deployment or config.embed_deployment()
+    vectors = []
+    for start in range(0, len(texts), batch_size):
+        response = client.embeddings.create(model=deployment, input=texts[start:start + batch_size])
+        vectors.extend(item.embedding for item in sorted(response.data, key=lambda item: item.index))
+        if show_progress:
+            print(f"  embedded {min(start + batch_size, len(texts))}/{len(texts)}", flush=True)
+    return np.asarray(vectors, dtype=np.float32)
+
+
+def azure_encoder(client=None, deployment=None):
+    """A function that embeds one query with the Azure deployment, as retrievers expect."""
+    return lambda query: azure_embed([query], client, deployment)[0]
+
+
+def load_or_azure_embed(texts, out_dir, cache_name="azure_parents", client=None):
+    """Load the saved Azure vectors, or embed the texts and save them, so the corpus is only paid for once."""
+    path = embeddings_path(out_dir, cache_name)
+    if path.exists():
+        vectors = np.load(path)
+        if len(vectors) == len(texts):
+            return vectors
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vectors = azure_embed(texts, client, show_progress=True)
+    np.save(path, vectors)
+    return vectors

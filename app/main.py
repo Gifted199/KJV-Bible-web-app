@@ -6,6 +6,10 @@
     evaluate [--model all]       score each model and store on data/test_questions.json
     compare                      score the ten retrieval techniques on data/test_questions.json
     rerank                       score Hybrid with a bi-encoder and two cross-encoder rerankers
+    check                        test the connection to Azure OpenAI, AI Search and Langfuse (prints no secrets)
+    azure-index                  embed the parents with text-embedding-3-small and upload them to Azure AI Search
+    azure-storage                show the index size against the free-tier limits
+    azure-compare                score Azure AI Search hybrid, with and without bge, beside the local Hybrid + bge
 """
 
 import argparse
@@ -22,6 +26,7 @@ from app.dense_retriever import (
 )
 
 DATA_DIR = "data"
+EMBED_PRICE_PER_MILLION = 0.02  # text-embedding-3-small list price, US$ per million tokens
 STORES = ["faiss", "chroma"]
 
 
@@ -113,13 +118,19 @@ def cmd_evaluate(args):
 
 
 def compare_techniques(retrievers, questions):
-    """Score every technique; returns (overall table, MRR-by-question-type table), best first."""
+    """Score every technique; returns (overall table, MRR-by-question-type table), best first.
+
+    "s/question" is the average search time, measured after one warm-up search (which loads any model).
+    """
     import pandas as pd
 
     rows, by_type = [], {}
     for name, retriever in retrievers.items():
+        retriever.search(questions[0]["question"], 10)
+        start = time.perf_counter()
         scores, details = evaluation.evaluate(lambda q: retriever.search(q, 10), questions)
-        rows.append({"technique": name, **scores})
+        seconds = (time.perf_counter() - start) / len(questions)
+        rows.append({"technique": name, **scores, "s/question": round(seconds, 2)})
         by_type[name] = {
             t: evaluation.score([d for d in details if d["type"] == t])["MRR"]
             for t in dict.fromkeys(d["type"] for d in details)
@@ -157,6 +168,81 @@ def cmd_rerank(args):
           f"\n\nMRR by question type:\n{by_type}")
 
 
+def cmd_check(args):
+    from app.config import check_connections
+
+    failures = 0
+    for service, ok, message in check_connections():
+        failures += not ok
+        print(f"{'OK  ' if ok else 'FAIL'} {service:10} {message}")
+    if failures:
+        raise SystemExit(1)
+
+
+def cmd_azure_index(args):
+    from app import azure_search, config
+
+    _, parents_by_id = load_chunks()
+    parents = list(parents_by_id.values())
+    texts = [p["text"] for p in parents]
+    tokens = embeddings.count_tokens(texts)
+    print(f"{len(texts)} parents, {tokens:,} tokens, about ${tokens / 1e6 * EMBED_PRICE_PER_MILLION:.4f} to embed")
+    start = time.perf_counter()
+    vectors = embeddings.load_or_azure_embed(texts, DATA_DIR)
+    print(f"vectors: {vectors.shape[0]} x {vectors.shape[1]} ({time.perf_counter() - start:.0f}s, cached in "
+          f"{embeddings.embeddings_path(DATA_DIR, 'azure_parents')})")
+
+    name = config.search_index_name()
+    azure_search.create_index(config.search_index_client(), name, vectors.shape[1])
+    documents = azure_search.to_documents(parents, vectors)
+    start = time.perf_counter()
+    azure_search.upload(config.search_client(), documents)
+    count = azure_search.wait_for_documents(config.search_client(), len(documents))
+    print(f"index '{name}': {count} documents searchable ({time.perf_counter() - start:.0f}s)")
+    print_storage(azure_search.storage_report(config.search_index_client(), name))
+
+
+def print_storage(report):
+    mb = lambda n: f"{n / 1e6:.1f} MB"
+    print(f"documents: {report['documents']}")
+    print(f"index storage: {mb(report['index storage'])} (of which vector index {mb(report['index vector size'])})")
+    for label in ("service storage", "service vector index"):
+        used, quota = report[label]
+        print(f"{label}: {mb(used)} used of {mb(quota)} ({used / quota:.0%})" if quota else f"{label}: {mb(used)}")
+    print("(index statistics can lag a few minutes behind an upload; run `azure-storage` again later to refresh)")
+
+
+def cmd_azure_storage(args):
+    from app import azure_search, config
+
+    print_storage(azure_search.storage_report(config.search_index_client(), config.search_index_name()))
+
+
+def cmd_azure_compare(args):
+    import pandas as pd
+
+    from app import config
+    from app.azure_search import AzureSearchRetriever
+    from app.reranker import CROSS_ENCODERS, RerankRetriever, cross_encoder_scorer
+    from app.techniques import build_hybrid
+
+    _, parents_by_id = load_chunks()
+    questions = load_questions(parents_by_id)
+    bge = cross_encoder_scorer(CROSS_ENCODERS["bge"])
+    local = build_hybrid(DATA_DIR)
+    azure = AzureSearchRetriever(config.search_client(), parents_by_id, embeddings.azure_encoder())
+    retrievers = {
+        "Local Hybrid (mpnet + BM25)": local,
+        "Local Hybrid + bge": RerankRetriever(local, bge),
+        "AI Search hybrid": azure,
+        "AI Search hybrid + bge": RerankRetriever(azure, bge),
+    }
+    overall, by_type = compare_techniques(retrievers, questions)
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", None)
+    print(f"{len(questions)} test questions\n\n{overall}\n\nMRR by question type:\n{by_type}")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="python -m app.main", description="KJV RAG pipeline")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -190,6 +276,19 @@ def main():
     rerank = commands.add_parser("rerank", help="score Hybrid with and without each reranker on the test questions")
     rerank.add_argument("--candidates", type=int, default=10, help="how many Hybrid results get re-scored")
     rerank.set_defaults(run=cmd_rerank)
+
+    check = commands.add_parser("check", help="test the connection to every cloud service")
+    check.set_defaults(run=cmd_check)
+
+    azure_index = commands.add_parser("azure-index", help="embed the parents and upload them to Azure AI Search")
+    azure_index.set_defaults(run=cmd_azure_index)
+
+    azure_storage = commands.add_parser("azure-storage", help="show the index size against the free-tier limits")
+    azure_storage.set_defaults(run=cmd_azure_storage)
+
+    azure_compare = commands.add_parser("azure-compare", help="score AI Search hybrid, with and without bge, "
+                                                              "beside the local Hybrid + bge")
+    azure_compare.set_defaults(run=cmd_azure_compare)
 
     args = parser.parse_args()
     args.run(args)

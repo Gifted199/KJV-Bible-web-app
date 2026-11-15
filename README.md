@@ -29,8 +29,12 @@ KJV Rag/
 │   ├── reranker.py              # bi-encoder and cross-encoder rerankers
 │   ├── techniques.py            # builds the ten techniques; best_retriever() = Hybrid + bge reranking
 │   ├── evaluation.py            # precision@5, recall@5, MRR, nDCG@5
+│   ├── config.py                # Azure OpenAI, AI Search and Langfuse settings and clients, from .env
+│   ├── azure_search.py          # the kjv-parents index in Azure AI Search: create, upload, hybrid search
 │   └── main.py                  # CLI: python -m app.main <command>
-├── tests/test_retrieval.py      # runs without model downloads
+├── tests/                       # run offline: no model downloads, fake Azure clients
+├── docs/PLAN.md                 # plan for generation, evaluation, guardrails, API, UI and deployment
+├── .env.example                 # the settings .env needs (the real .env is git-ignored)
 ├── RAG_Retrieval_walkthrough.ipynb   # the same steps, cell by cell, with explanations and results
 ├── requirements.txt
 └── README.md
@@ -65,6 +69,12 @@ uv run python -m app.main search "Jonah is swallowed by a big fish"   # Hybrid +
 uv run python -m app.main evaluate    # score each embedding model and vector store
 uv run python -m app.main compare     # score the ten retrieval techniques
 uv run python -m app.main rerank      # score Hybrid with each reranker
+
+# Azure (needs .env; copy .env.example and fill it in)
+uv run python -m app.main check          # test each cloud service (prints no secrets)
+uv run python -m app.main azure-index    # embed the parents with text-embedding-3-small and upload to AI Search
+uv run python -m app.main azure-storage  # index size against the free-tier limit
+uv run python -m app.main azure-compare  # AI Search hybrid, with and without bge, beside the local Hybrid + bge
 ```
 
 `search` takes `--technique rerank` (the default, most accurate, about 3 seconds per question on a CPU), `--technique hybrid` (about 0.05 seconds) or `--technique dense`. The first search also loads the models, which takes about 30 seconds.
@@ -229,7 +239,7 @@ MRR by question type:
 | Hybrid (no reranker) | 0.944 | 0.787 | 0.958 | 0.806 |
 | Hybrid + bi-encoder | 0.607 | 0.774 | 0.743 | 0.792 |
 
-### Why the bge cross-encoder was chosen
+### Why the bge cross-encoder was chosen (local Hybrid)
 
 - **It is the best on all four metrics.** MRR rises from 0.874 to 0.945 and nDCG@5 from 0.865 to 0.930. The right passage comes first for 49 of the 54 questions instead of 42, and is in the top 5 for all 54.
 - **Every quote and every topic question now has a right passage first** (MRR 1.000).
@@ -244,10 +254,51 @@ MRR by question type:
 - **The MiniLM cross-encoder** gets two more questions right at #1, but its precision, recall and nDCG@5 are lower or the same, and it is worse on quotes (0.882 vs 0.944).
 - **The bi-encoder makes every metric worse.** It drops Hybrid's ordering, including BM25's exact word matching, and replaces it with one vector comparison, which is the weakest kind of search on this text. Quotes fall from 0.944 to 0.607.
 
+### 5. Moving to Azure: AI Search hybrid + bge
+
+The deployed app uses managed Azure services, so the local search was rebuilt on Azure and measured again on the same 54 questions:
+
+- **Embeddings:** Azure OpenAI `text-embedding-3-small`, 1,536 dimensions, replacing mpnet.
+- **Index:** `kjv-parents` in **Azure AI Search, free tier**.
+  - **Contents:** one document per parent passage (4,723 documents).
+  - **Fields:** keyword fields scored with BM25, and an HNSW vector field.
+  - **Hybrid search:** runs both and fuses them with reciprocal rank fusion, like the local Hybrid.
+
+| | P@5 | R@5 | MRR | nDCG@5 | #1 | Top 5 | Seconds per question |
+|---|---|---|---|---|---|---|---|
+| **Local Hybrid + bge** (baseline) | **0.307** | **0.963** | **0.945** | **0.930** | **49** | **54** | 4.26 |
+| **AI Search hybrid + bge** (chosen) | 0.293 | 0.927 | 0.927 | 0.902 | 48 | 53 | 4.23 |
+| Local Hybrid, no reranker | 0.296 | 0.933 | 0.874 | 0.865 | 42 | 53 | 0.08 |
+| AI Search hybrid, no reranker | 0.300 | 0.948 | 0.801 | 0.811 | 36 | 54 | 0.31 |
+
+MRR by question type:
+
+| | Quote | Paraphrase | Names a book | Topic |
+|---|---|---|---|---|
+| Local Hybrid + bge | **1.000** | 0.910 | 0.903 | **1.000** |
+| AI Search hybrid + bge | 0.938 | **0.912** | 0.903 | **1.000** |
+| Local Hybrid, no reranker | 0.944 | 0.787 | **0.958** | 0.806 |
+| AI Search hybrid, no reranker | 0.846 | 0.737 | 0.806 | 0.889 |
+
+**Why bge stays:**
+- **Without bge, AI Search is the weakest of the four.** It finds the right passages: recall@5 is 0.948, and all 54 questions have one in the top 5. But it often ranks them lower, so only 36 of 54 are at #1.
+- **bge fixes the order.** MRR rises from 0.801 to 0.927, and 12 more questions get the right passage first.
+- **The time is almost all bge.** AI Search on its own takes 0.31 seconds (embedding the question plus the search). bge adds about 4 seconds on this laptop's CPU, the same as in the local pipeline.
+
+**How close Azure is to the local baseline:**
+- AI Search + bge is one question behind at #1 (48 vs 49) and one behind in the top 5 (53 vs 54).
+- On 54 questions that difference is too small to call: it could change with another set of questions.
+
+**Storage on the free tier:**
+- The index uses **40.8 MB of the 52.4 MB limit (78%)**. Azure also reports a separate vector index size of 87.8 MB, with no quota shown.
+- Indexing the 14,618 children as well would not fit, which is why the parents were indexed.
+
+**Cost:** embedding the corpus took 1.17 million tokens, about $0.02. It took 12 minutes because the deployment's rate limit is 99,000 tokens per minute.
+
 ## Tests
 
 ```
 uv run pytest
 ```
 
-The tests use small made-up inputs and fake vectors, so they need no model downloads.
+The tests use small made-up inputs, fake vectors and fake Azure clients, so they need no model downloads, network or keys.
